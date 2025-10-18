@@ -2,6 +2,12 @@
 
 Automatically monitors your inbox for non-English emails, translates them using OpenAI, and sends formatted notifications via Telegram.
 
+## 📺 Introduction Video
+
+[![Watch the introduction video](https://img.youtube.com/vi/oeSwknlLkMQ/maxresdefault.jpg)](https://youtu.be/oeSwknlLkMQ)
+
+Click the image above to watch a quick introduction to this project.
+
 ## Quick Start
 
 ```bash
