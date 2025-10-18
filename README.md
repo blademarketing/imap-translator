@@ -2,6 +2,35 @@
 
 Automatically monitors your inbox for non-English emails, translates them using OpenAI, and sends formatted notifications via Telegram.
 
+## Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/blademarketing/imap-translator.git
+cd imap-translator
+
+# Set up virtual environment
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure credentials
+cp .env.example .env
+# Edit .env with your credentials
+
+# Test the service (optional)
+python email_translator.py
+# Press Ctrl+C to stop
+
+# Install as systemd service (Linux only)
+sudo cp email-translator.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable email-translator.service
+sudo systemctl start email-translator.service
+```
+
 ## Features
 
 - Monitors inbox every 60 seconds for unread emails
