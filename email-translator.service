@@ -1,0 +1,20 @@
+[Unit]
+Description=Email Translation Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/tools/imap-translator
+Environment=PATH=/tools/imap-translator/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/tools/imap-translator/venv/bin/python -u /tools/imap-translator/email_translator.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=email-translator
+
+[Install]
+WantedBy=multi-user.target
