@@ -24,14 +24,41 @@ load_dotenv()
 
 # Configuration
 CACHE_FILE = '/tools/imap-translator/processed_emails.json'
-IMAP_SERVER = os.getenv('IMAP_SERVER')
-IMAP_PORT = int(os.getenv('IMAP_PORT'))
-IMAP_EMAIL = os.getenv('IMAP_EMAIL')
-IMAP_PASSWORD = os.getenv('IMAP_PASSWORD')
+MAX_EMAILS = int(os.getenv('MAX_EMAILS', '50'))  # Maximum number of recent emails to check
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-3.5-turbo')
+
+# Parse IMAP accounts - support both single account (legacy) and multiple accounts (JSON)
+IMAP_ACCOUNTS = []
+imap_accounts_json = os.getenv('IMAP_ACCOUNTS')
+if imap_accounts_json:
+    # Multiple accounts via JSON
+    try:
+        IMAP_ACCOUNTS = json.loads(imap_accounts_json)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing IMAP_ACCOUNTS JSON: {e}")
+        sys.exit(1)
+else:
+    # Legacy single account support
+    imap_server = os.getenv('IMAP_SERVER')
+    imap_port = os.getenv('IMAP_PORT')
+    imap_email = os.getenv('IMAP_EMAIL')
+    imap_password = os.getenv('IMAP_PASSWORD')
+
+    if imap_server and imap_port and imap_email and imap_password:
+        IMAP_ACCOUNTS = [{
+            'server': imap_server,
+            'port': int(imap_port),
+            'email': imap_email,
+            'password': imap_password,
+            'name': imap_email  # Use email as default name
+        }]
+
+if not IMAP_ACCOUNTS:
+    print("Error: No IMAP accounts configured. Please set IMAP_ACCOUNTS or legacy IMAP_* variables.")
+    sys.exit(1)
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -42,10 +69,19 @@ def load_cache():
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'r') as f:
-                return json.load(f)
+                cache = json.load(f)
+                # Migrate old format to new format
+                if 'processed_ids' in cache and not isinstance(cache.get('processed_ids'), dict):
+                    # Old format: {"processed_ids": ["id1", "id2"]}
+                    # Convert to new format with a default account
+                    old_ids = cache['processed_ids']
+                    cache = {"accounts": {"default": old_ids}}
+                elif 'accounts' not in cache:
+                    cache = {"accounts": {}}
+                return cache
         except:
-            return {"processed_ids": []}
-    return {"processed_ids": []}
+            return {"accounts": {}}
+    return {"accounts": {}}
 
 
 def save_cache(cache):
@@ -121,11 +157,11 @@ Please provide the following information in a structured JSON format:
 1. "language": The original language name (e.g., "Swedish", "Spanish", "French")
 2. "tldr": A one-line TL;DR summary of what the email is about (in English)
 3. "action_required": Boolean - true if the recipient needs to take action, false otherwise
-4. "category": One of: "receipt", "marketing", "notification", "personal", "business", "support", "newsletter", "account", "other"
+4. "category": ENUM of: "receipt", "marketing", "notification", "personal", "business", "support", "newsletter", "account", "other"
 5. "translated_subject": The subject translated to English
 6. "translated_body": The body translated to English
 
-Return ONLY the JSON object, no other text."""
+Return result as a JSON object ONLY, no other text."""
 
     try:
         response = openai_client.chat.completions.create(
@@ -134,7 +170,7 @@ Return ONLY the JSON object, no other text."""
                 {"role": "system", "content": "You are a helpful email translation and analysis assistant. Always respond with valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3
+            temperature=0.4
         )
 
         result_text = response.choices[0].message.content.strip()
@@ -152,8 +188,8 @@ Return ONLY the JSON object, no other text."""
         return None
 
 
-def send_telegram_message(message):
-    """Send a message via Telegram bot."""
+def send_telegram_message(message, max_retries=3):
+    """Send a message via Telegram bot with retry logic and rate limit handling."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     payload = {
@@ -162,8 +198,28 @@ def send_telegram_message(message):
         'parse_mode': 'HTML'
     }
 
-    response = requests.post(url, data=payload)
-    return response.json()
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, data=payload, timeout=30)
+            result = response.json()
+
+            # Check for rate limit (HTTP 429)
+            if response.status_code == 429:
+                retry_after = result.get('parameters', {}).get('retry_after', 5)
+                print(f"    → Telegram rate limit hit, waiting {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+
+            return result
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
+                print(f"    → Network error sending to Telegram (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"    → Failed to send Telegram message after {max_retries} attempts: {str(e)}")
+                return {'ok': False, 'error': str(e)}
 
 
 def escape_html(text):
@@ -173,7 +229,7 @@ def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def format_telegram_message(from_addr, analysis):
+def format_telegram_message(from_addr, analysis, inbox_name=None):
     """Format the Telegram message with email details."""
     action_emoji = "🔴" if analysis['action_required'] else "🟢"
 
@@ -185,9 +241,15 @@ def format_telegram_message(from_addr, analysis):
     safe_subject = escape_html(analysis['translated_subject'])
     safe_body = escape_html(analysis['translated_body'][:1000])
 
+    # Add inbox info if provided
+    inbox_info = ""
+    if inbox_name:
+        safe_inbox = escape_html(inbox_name)
+        inbox_info = f"📬 <b>Inbox:</b> {safe_inbox}\n"
+
     message = f"""📧 <b>Foreign Language Email Received</b>
 
-🌍 <b>Language:</b> {safe_language}
+{inbox_info}🌍 <b>Language:</b> {safe_language}
 👤 <b>From:</b> {safe_from}
 📝 <b>TL;DR:</b> {safe_tldr}
 {action_emoji} <b>Action Required:</b> {'Yes' if analysis['action_required'] else 'No'}
@@ -203,27 +265,34 @@ def format_telegram_message(from_addr, analysis):
     return message
 
 
-def connect_imap():
-    """Connect to IMAP server."""
-    imap = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-    imap.login(IMAP_EMAIL, IMAP_PASSWORD)
+def connect_imap(account):
+    """Connect to IMAP server for a specific account."""
+    imap = imaplib.IMAP4_SSL(account['server'], account['port'])
+    imap.login(account['email'], account['password'])
     return imap
 
 
-def process_emails():
-    """Main function to check and process emails."""
+def process_account_emails(account, cache):
+    """Process emails for a single IMAP account."""
+    account_email = account['email']
+    account_name = account.get('name', account_email)
+
     try:
-        # Load cache
-        cache = load_cache()
-        processed_ids = set(cache['processed_ids'])
+        # Get processed IDs for this account
+        if account_email not in cache['accounts']:
+            cache['accounts'][account_email] = []
+        processed_ids = set(cache['accounts'][account_email])
 
         # Connect to IMAP
-        imap = connect_imap()
+        imap = connect_imap(account)
         imap.select('INBOX')
 
-        # Search for unread emails using PEEK
-        status, messages = imap.search(None, 'UNSEEN')
+        # Search for all emails (both read and unread)
+        status, messages = imap.search(None, 'ALL')
         email_ids = messages[0].split()
+
+        # Get only the most recent MAX_EMAILS emails
+        email_ids = email_ids[-MAX_EMAILS:] if len(email_ids) > MAX_EMAILS else email_ids
 
         new_emails_processed = 0
 
@@ -234,62 +303,99 @@ def process_emails():
             if email_id_str in processed_ids:
                 continue
 
-            # Fetch email using PEEK to keep it unread
-            status, msg_data = imap.fetch(email_id, '(BODY.PEEK[])')
+            try:
+                # Fetch email using PEEK to keep it unread
+                status, msg_data = imap.fetch(email_id, '(BODY.PEEK[])')
 
-            for response_part in msg_data:
-                if isinstance(response_part, tuple):
-                    msg = email.message_from_bytes(response_part[1])
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
 
-                    # Decode headers
-                    subject = decode_mime_header(msg['subject'])
-                    from_addr = decode_mime_header(msg['from'])
+                        # Decode headers
+                        subject = decode_mime_header(msg['subject'])
+                        from_addr = decode_mime_header(msg['from'])
 
-                    # Get body
-                    body = get_email_body(msg)
+                        # Get body
+                        body = get_email_body(msg)
 
-                    # Combine for language detection
-                    combined_text = f"{subject} {body}"
+                        # Combine for language detection
+                        combined_text = f"{subject} {body}"
 
-                    print(f"Processing email ID {email_id_str} from {from_addr}")
+                        print(f"  [{account_name}] Processing email ID {email_id_str} from {from_addr}")
 
-                    # Check if English
-                    if is_english(combined_text):
-                        print(f"  → Email is in English, skipping")
-                    else:
-                        print(f"  → Non-English email detected, translating...")
-
-                        # Translate and analyze
-                        analysis = translate_and_analyze_email(subject, body, from_addr)
-
-                        if analysis:
-                            # Format and send Telegram message
-                            telegram_msg = format_telegram_message(from_addr, analysis)
-                            result = send_telegram_message(telegram_msg)
-
-                            if result.get('ok'):
-                                print(f"  → Telegram notification sent successfully")
-                                new_emails_processed += 1
-                            else:
-                                print(f"  → Failed to send Telegram notification: {result}")
+                        # Check if English
+                        if is_english(combined_text):
+                            print(f"    → Email is in English, skipping")
                         else:
-                            print(f"  → Failed to translate email")
+                            print(f"    → Non-English email detected, translating...")
 
-                    # Mark as processed
-                    processed_ids.add(email_id_str)
+                            # Translate and analyze
+                            analysis = translate_and_analyze_email(subject, body, from_addr)
 
-        # Save updated cache
-        cache['processed_ids'] = list(processed_ids)
-        save_cache(cache)
+                            if analysis:
+                                # Format and send Telegram message with inbox info
+                                telegram_msg = format_telegram_message(from_addr, analysis, account_name)
+                                result = send_telegram_message(telegram_msg)
+
+                                if result.get('ok'):
+                                    print(f"    → Telegram notification sent successfully")
+                                    new_emails_processed += 1
+                                    # Small delay to avoid rate limits (1 message/sec to same chat)
+                                    time.sleep(1.5)
+                                else:
+                                    print(f"    → Failed to send Telegram notification: {result}")
+                            else:
+                                print(f"    → Failed to translate email")
+
+                        # Mark as processed
+                        processed_ids.add(email_id_str)
+
+            except Exception as e:
+                print(f"    → Error processing email ID {email_id_str}: {str(e)}")
+                # Mark as processed anyway to avoid getting stuck on problematic emails
+                processed_ids.add(email_id_str)
+                continue
+
+        # Update cache for this account
+        cache['accounts'][account_email] = list(processed_ids)
 
         # Close connection
         imap.close()
         imap.logout()
 
-        print(f"Check completed. Processed {new_emails_processed} new non-English emails.")
+        print(f"  [{account_name}] Check completed. Processed {new_emails_processed} new non-English emails.")
+        return new_emails_processed
 
     except Exception as e:
-        print(f"Error processing emails: {str(e)}")
+        print(f"  [{account_name}] Error processing emails: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return 0
+
+
+def process_emails():
+    """Main function to check and process emails for all accounts."""
+    try:
+        # Load cache
+        cache = load_cache()
+
+        total_processed = 0
+
+        # Process each IMAP account
+        for account in IMAP_ACCOUNTS:
+            account_name = account.get('name', account['email'])
+            print(f"\nChecking account: {account_name}")
+            processed = process_account_emails(account, cache)
+            total_processed += processed
+
+        # Save updated cache
+        save_cache(cache)
+
+        print(f"\n{'='*50}")
+        print(f"Total: Processed {total_processed} new non-English emails across all accounts.")
+
+    except Exception as e:
+        print(f"Error in main process: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -297,7 +403,11 @@ def process_emails():
 def main():
     """Main loop - runs continuously checking emails every minute."""
     print(f"Email Translation Service started at {datetime.now()}")
-    print(f"Monitoring: {IMAP_EMAIL}")
+    print(f"Monitoring {len(IMAP_ACCOUNTS)} account(s):")
+    for account in IMAP_ACCOUNTS:
+        account_name = account.get('name', account['email'])
+        print(f"  - {account_name} ({account['email']})")
+    print(f"Max emails to check per account: {MAX_EMAILS}")
     print(f"Checking every 60 seconds...")
     print("-" * 50)
 
